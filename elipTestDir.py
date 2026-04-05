@@ -9,7 +9,7 @@ import numpy as np
 # =========================
 # CONFIG
 # =========================
-IMG_NAME = "3.png"
+IMG_NAME = "5.png"
 ROOT_PATH = "img"
 
 FLOWER_CENTER_MODE = "ellipse"
@@ -18,6 +18,7 @@ CENTER_RADIUS_RATIO = 0.12
 
 PISTIL_ASPECT_RATIO_THR = 1.4
 MINOR_AXIS_DIST_DELTA = 3.0
+
 LAB_PATCH_RADIUS = 30
 VECTOR_SCALE = 2.0
 
@@ -27,7 +28,6 @@ VECTOR_SCALE = 2.0
 # =========================
 def apply_mask_to_bgr(img_bgr, mask):
     return cv2.bitwise_and(img_bgr, img_bgr, mask=mask)
-
 
 
 def normalize_to_uint8(x):
@@ -42,7 +42,6 @@ def normalize_to_uint8(x):
     return np.clip(255.0 * y, 0, 255).astype(np.uint8)
 
 
-
 def keep_largest_component(mask):
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
     if num_labels <= 1:
@@ -52,13 +51,11 @@ def keep_largest_component(mask):
     return np.where(labels == largest_id, 255, 0).astype(np.uint8)
 
 
-
 def largest_contour_from_mask(binary_mask):
     contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if len(contours) == 0:
         return None
     return max(contours, key=cv2.contourArea)
-
 
 
 def contour_centroid_from_contour(cnt):
@@ -72,7 +69,6 @@ def contour_centroid_from_contour(cnt):
     cx = int(M["m10"] / M["m00"])
     cy = int(M["m01"] / M["m00"])
     return (cx, cy)
-
 
 
 def project_point_to_line(pt, line_point, line_dir):
@@ -91,7 +87,6 @@ def project_point_to_line(pt, line_point, line_dir):
     t = float(np.dot(p - p0, d))
     proj = p0 + t * d
     return proj
-
 
 
 def point_to_line_distance(pt, line_point, line_dir):
@@ -150,7 +145,6 @@ def keep_component_nearest_center(mask, cx, cy, min_area=3):
         return np.zeros_like(mask)
 
     return np.where(labels == best_id, 255, 0).astype(np.uint8)
-
 
 
 def pistil_mask_from_flower_only(
@@ -229,7 +223,6 @@ def flower_reference_center_from_outer_contour(cnt, mode="ellipse"):
     return center, info
 
 
-
 def flower_minor_axis_from_contour(cnt):
     if cnt is None or len(cnt) < 5:
         return {}
@@ -285,7 +278,6 @@ def pistil_rotated_rect_from_contour(cnt):
     return rect, box
 
 
-
 def mean_L_around_point(L_channel, pt, radius=2):
     if L_channel is None or pt is None:
         return None
@@ -306,7 +298,6 @@ def mean_L_around_point(L_channel, pt, radius=2):
         return None
 
     return float(np.mean(patch))
-
 
 
 def pistil_base_and_tip_from_rotated_rect(
@@ -429,7 +420,6 @@ def pistil_base_and_tip_from_rotated_rect(
     }
 
 
-
 def pistil_base_tip_hybrid(
     cnt,
     flower_center,
@@ -476,7 +466,6 @@ def pistil_base_tip_hybrid(
     return base_pt, tip_pt, info
 
 
-
 def pistil_circle_from_contour(cnt):
     if cnt is None:
         return None
@@ -487,7 +476,7 @@ def pistil_circle_from_contour(cnt):
 # =========================
 # DIRECTION
 # =========================
-def flower_direction_from_points(p_from, p_to):
+def direction_from_points(p_from, p_to):
     if p_from is None or p_to is None:
         return None
 
@@ -530,6 +519,7 @@ def draw_detection_image(
     pistil_axis_info,
 ):
     out = img_bgr.copy()
+    pistil_mode = pistil_axis_info.get("mode", "")
 
     if flower_cnt is not None:
         cv2.drawContours(out, [flower_cnt], -1, (255, 0, 0), 2)
@@ -538,7 +528,6 @@ def draw_detection_image(
 
     if pistil_cnt is not None:
         cv2.drawContours(out, [pistil_cnt], -1, (0, 0, 255), 2)
-        pistil_mode = pistil_axis_info.get("mode", "")
 
         if pistil_mode == "elongated_rect":
             box = pistil_axis_info.get("box", None)
@@ -570,11 +559,27 @@ def draw_detection_image(
     elif flower_geom_info.get("mode") == "ellipse":
         cv2.ellipse(out, flower_geom_info["ellipse"], (0, 255, 0), 1)
 
+    if pistil_mode == "frontal_circle_like":
+        center_pt = pistil_axis_info.get("center", pistil_base)
+        if center_pt is not None:
+            cv2.circle(out, center_pt, 6, (255, 255, 0), -1)
+            cv2.putText(
+                out,
+                f"Pistil center {center_pt}",
+                (center_pt[0] + 8, center_pt[1] - 10),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.60,
+                (255, 255, 0),
+                2,
+                cv2.LINE_AA,
+            )
+        return out
+
     if pistil_base is not None:
         cv2.circle(out, pistil_base, 6, (255, 255, 0), -1)
         cv2.putText(
             out,
-            f"Pistil base {pistil_base}",
+            f"P1 {pistil_base}",
             (pistil_base[0] + 8, pistil_base[1] - 10),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.60,
@@ -587,7 +592,7 @@ def draw_detection_image(
         cv2.circle(out, pistil_tip, 6, (0, 255, 255), -1)
         cv2.putText(
             out,
-            f"Pistil tip {pistil_tip}",
+            f"P2 {pistil_tip}",
             (pistil_tip[0] + 8, pistil_tip[1] - 10),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.60,
@@ -596,12 +601,13 @@ def draw_detection_image(
             cv2.LINE_AA,
         )
 
-    if pistil_axis_info.get("mode") == "elongated_rect":
-        if pistil_base is not None and pistil_tip is not None:
-            cv2.line(out, pistil_base, pistil_tip, (255, 255, 255), 2)
+    if pistil_base is not None and pistil_tip is not None:
+        cv2.line(out, pistil_base, pistil_tip, (255, 255, 255), 2)
+
+    if flower_center is not None and pistil_base is not None:
+        cv2.line(out, pistil_base, flower_center, (0, 255, 0), 1)
 
     return out
-
 
 
 def draw_direction_vector_image(
@@ -611,9 +617,11 @@ def draw_direction_vector_image(
     flower_center,
     pistil_base,
     pistil_tip,
+    pistil_axis_info,
     vector_scale=12.0,
 ):
     out = img_bgr.copy()
+    pistil_mode = pistil_axis_info.get("mode", "")
 
     if flower_cnt is not None:
         cv2.drawContours(out, [flower_cnt], -1, (255, 0, 0), 2)
@@ -623,15 +631,28 @@ def draw_direction_vector_image(
 
     if flower_center is not None:
         cv2.circle(out, flower_center, 6, (0, 255, 0), -1)
+        cv2.putText(out, f"Flower C = {flower_center}", (15, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 255, 0), 2, cv2.LINE_AA)
+
+    if pistil_mode == "frontal_circle_like":
+        center_pt = pistil_axis_info.get("center", pistil_base)
+        if center_pt is not None:
+            cv2.circle(out, center_pt, 6, (255, 255, 0), -1)
+            cv2.putText(out, f"Pistil center = {center_pt}", (15, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (255, 255, 0), 2, cv2.LINE_AA)
+        cv2.putText(out, "Circle-like pistil -> khong ve vector huong", (15, 105), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (255, 255, 255), 2, cv2.LINE_AA)
+        return out, None
 
     if pistil_base is not None:
         cv2.circle(out, pistil_base, 6, (255, 255, 0), -1)
-
     if pistil_tip is not None:
         cv2.circle(out, pistil_tip, 6, (0, 255, 255), -1)
+
+    if pistil_base is not None and flower_center is not None:
+        cv2.line(out, pistil_base, flower_center, (0, 255, 0), 2)
+
+    if pistil_base is not None and pistil_tip is not None:
         cv2.line(out, pistil_base, pistil_tip, (255, 255, 255), 2)
 
-    info = flower_direction_from_points(pistil_base, flower_center)
+    info = direction_from_points(pistil_base, pistil_tip)
     if info is None:
         return out, None
 
@@ -643,13 +664,13 @@ def draw_direction_vector_image(
 
     cv2.arrowedLine(out, pistil_base, end_pt, (255, 255, 255), 5, tipLength=0.18)
 
-    cv2.putText(out, f"Flower C = {flower_center}", (15, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 255, 0), 2, cv2.LINE_AA)
-    cv2.putText(out, f"Pistil base = {pistil_base}", (15, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (255, 255, 0), 2, cv2.LINE_AA)
-    cv2.putText(out, f"dx = {info['dx']:.2f}, dy = {info['dy']:.2f}", (15, 105), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (255, 255, 255), 2, cv2.LINE_AA)
-    cv2.putText(out, f"theta_axis = {info['theta_axis_deg']:.2f} deg", (15, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(out, f"P1 = {pistil_base}", (15, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (255, 255, 0), 2, cv2.LINE_AA)
+    cv2.putText(out, f"P2 = {pistil_tip}", (15, 105), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(out, f"dx = {info['dx']:.2f}, dy = {info['dy']:.2f}", (15, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(out, f"theta_axis = {info['theta_axis_deg']:.2f} deg", (15, 175), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(out, "Doan xanh: P1 -> tam hoa | Mui ten trang: huong nhị P1 -> P2", (15, 210), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2, cv2.LINE_AA)
 
     return out, info
-
 
 
 def draw_lab_channels_with_points(L_channel, A_channel, B_channel, p1, p2):
@@ -693,7 +714,6 @@ def draw_lab_channels_with_points(L_channel, A_channel, B_channel, p1, p2):
     return fig
 
 
-
 def draw_pistil_selection_debug_image(
     img_bgr,
     flower_cnt,
@@ -701,6 +721,8 @@ def draw_pistil_selection_debug_image(
     flower_minor_info,
     pistil_axis_info,
     pistil_base,
+    pistil_tip,
+    flower_center,
     vector_scale=12.0,
 ):
     out = img_bgr.copy()
@@ -712,9 +734,7 @@ def draw_pistil_selection_debug_image(
     if pistil_cnt is not None:
         cv2.drawContours(out, [pistil_cnt], -1, (0, 0, 255), 2)
 
-    flower_center = None
     if flower_minor_info:
-        flower_center = flower_minor_info.get("center_int", None)
         ellipse = flower_minor_info.get("ellipse", None)
         minor_dir = flower_minor_info.get("minor_dir", None)
 
@@ -740,8 +760,8 @@ def draw_pistil_selection_debug_image(
     if box is not None:
         cv2.drawContours(out, [np.asarray(box, dtype=np.int32)], 0, (0, 165, 255), 2)
 
-    p1 = pistil_axis_info.get("candidate_a", None)
-    p2 = pistil_axis_info.get("candidate_b", None)
+    cand_a = pistil_axis_info.get("candidate_a", None)
+    cand_b = pistil_axis_info.get("candidate_b", None)
     d1 = pistil_axis_info.get("dist_a_to_minor_axis", None)
     d2 = pistil_axis_info.get("dist_b_to_minor_axis", None)
     l1 = pistil_axis_info.get("L_candidate_a", None)
@@ -750,8 +770,8 @@ def draw_pistil_selection_debug_image(
     axis_dir = pistil_axis_info.get("minor_axis_dir", None)
 
     for pt, color, label, dist_val, l_val, dy_txt in [
-        (p1, (0, 0, 255), "A", d1, l1, -10),
-        (p2, (255, 0, 0), "B", d2, l2, 18),
+        (cand_a, (0, 0, 255), "A", d1, l1, -10),
+        (cand_b, (255, 0, 0), "B", d2, l2, 18),
     ]:
         if pt is None:
             continue
@@ -781,22 +801,42 @@ def draw_pistil_selection_debug_image(
             cv2.LINE_AA,
         )
 
-    dir_info = flower_direction_from_points(pistil_base, flower_center)
-    if dir_info is not None and pistil_base is not None:
+    pistil_mode = pistil_axis_info.get("mode", "")
+    if pistil_mode == "elongated_rect" and pistil_base is not None and pistil_tip is not None:
         cv2.circle(out, pistil_base, 6, (255, 255, 0), -1)
-        L_vec = int(max(70, vector_scale * dir_info["norm"]))
-        end_pt = (
-            int(round(pistil_base[0] + L_vec * dir_info["ux"])),
-            int(round(pistil_base[1] + L_vec * dir_info["uy"])),
-        )
-        cv2.arrowedLine(out, pistil_base, end_pt, (255, 255, 255), 4, tipLength=0.18)
+        cv2.circle(out, pistil_tip, 6, (0, 255, 255), -1)
+
+        if flower_center is not None:
+            cv2.line(out, pistil_base, flower_center, (0, 255, 0), 2)
+
+        cv2.line(out, pistil_base, pistil_tip, (255, 255, 255), 2)
+
+        dir_info = direction_from_points(pistil_base, pistil_tip)
+        if dir_info is not None:
+            L_vec = int(max(70, vector_scale * dir_info["norm"]))
+            end_pt = (
+                int(round(pistil_base[0] + L_vec * dir_info["ux"])),
+                int(round(pistil_base[1] + L_vec * dir_info["uy"])),
+            )
+            cv2.arrowedLine(out, pistil_base, end_pt, (255, 255, 255), 4, tipLength=0.18)
+            cv2.putText(
+                out,
+                f"theta_axis = {dir_info['theta_axis_deg']:.2f} deg",
+                (15, 120),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.72,
+                (0, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+    elif pistil_mode == "frontal_circle_like":
         cv2.putText(
             out,
-            f"theta_axis = {dir_info['theta_axis_deg']:.2f} deg",
+            "Circle-like pistil -> khong ve vector huong",
             (15, 120),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.72,
-            (0, 255, 255),
+            (255, 255, 255),
             2,
             cv2.LINE_AA,
         )
@@ -812,7 +852,6 @@ def draw_pistil_selection_debug_image(
         cv2.putText(out, f"dist_gap = {dist_gap:.2f} | delta = {axis_dist_delta:.2f}", (15, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2, cv2.LINE_AA)
 
     return out
-
 
 
 def draw_pistil_mask_on_lab(L_channel, pistil_mask):
@@ -877,13 +916,14 @@ def main():
 
     print(f"latency: {t1 - t0:.6f} s")
     print("flower_center =", flower_center)
-    print("pistil_base   =", pistil_base)
-    print("pistil_tip    =", pistil_tip)
-    print("candidate_a   =", candidate_a, "L_mean =", La, "dist_to_minor_axis =", dist_a)
-    print("candidate_b   =", candidate_b, "L_mean =", Lb, "dist_to_minor_axis =", dist_b)
-    print("dist_gap      =", dist_gap)
-    print("minor axis ok =", minor_axis_available)
-    print("selected_by   =", selected_by)
+    print("pistil_point_1 =", pistil_base)
+    print("pistil_point_2 =", pistil_tip)
+    print("candidate_a    =", candidate_a, "L_mean =", La, "dist_to_minor_axis =", dist_a)
+    print("candidate_b    =", candidate_b, "L_mean =", Lb, "dist_to_minor_axis =", dist_b)
+    print("dist_gap       =", dist_gap)
+    print("minor axis ok  =", minor_axis_available)
+    print("selected_by    =", selected_by)
+    print("pistil_mode    =", pistil_axis_info.get("mode", None))
 
     if flower_cnt is not None:
         print(f"flower contour area = {cv2.contourArea(flower_cnt):.2f}")
@@ -913,6 +953,7 @@ def main():
         flower_center,
         pistil_base,
         pistil_tip,
+        pistil_axis_info,
         vector_scale=VECTOR_SCALE,
     )
 
@@ -923,14 +964,18 @@ def main():
         flower_minor_info,
         pistil_axis_info,
         pistil_base,
+        pistil_tip,
+        flower_center,
         vector_scale=VECTOR_SCALE,
     )
 
     img_pistil_lab_mask = draw_pistil_mask_on_lab(L_channel, pistil_mask)
 
     if dir_info is not None:
-        print(f"dx = {dir_info['dx']:.3f}, dy = {dir_info['dy']:.3f}")
-        print(f"theta_axis_deg = {dir_info['theta_axis_deg']:.3f}")
+        print(f"pistil dx = {dir_info['dx']:.3f}, dy = {dir_info['dy']:.3f}")
+        print(f"pistil theta_axis_deg = {dir_info['theta_axis_deg']:.3f}")
+    else:
+        print("Pistil gan hinh tron -> khong tinh / khong ve vector huong.")
 
     plt.figure(figsize=(24, 12))
 
@@ -941,7 +986,7 @@ def main():
 
     plt.subplot(2, 4, 2)
     plt.imshow(cv2.cvtColor(img_detect, cv2.COLOR_BGR2RGB))
-    plt.title("Hinh 1 - Vien hoa/nhuy va tam")
+    plt.title("Hinh 1 - Vien hoa/nhuy va P1, P2")
     plt.axis("off")
 
     plt.subplot(2, 4, 3)
@@ -956,7 +1001,7 @@ def main():
 
     plt.subplot(2, 4, 5)
     plt.imshow(cv2.cvtColor(img_vector, cv2.COLOR_BGR2RGB))
-    plt.title("Hinh 4 - Vector tu pistil base den tam hoa")
+    plt.title("Hinh 4 - Huong nhị P1 -> P2")
     plt.axis("off")
 
     plt.subplot(2, 4, 6)
@@ -966,7 +1011,7 @@ def main():
 
     plt.subplot(2, 4, 7)
     plt.imshow(cv2.cvtColor(img_select_debug, cv2.COLOR_BGR2RGB))
-    plt.title("Hinh 6 - Ellipse + vector + khoang cach / LAB")
+    plt.title("Hinh 6 - Ellipse + chon P1/P2 + vector")
     plt.axis("off")
 
     plt.subplot(2, 4, 8)
