@@ -5,189 +5,299 @@ import numpy as np
 import time
 
 
-def to_gray(img_bgr, crop_border=0):
-    work = img_bgr.copy()
-    if (
-        crop_border > 0
-        and work.shape[0] > 2 * crop_border
-        and work.shape[1] > 2 * crop_border
-    ):
-        work = work[crop_border:-crop_border, crop_border:-crop_border]
+# =========================================================
+# THAM SO CHUNG
+# =========================================================
+DRAW_THICKNESS = 1
+FLOWER_MIN_COMPONENT_AREA = 100
+PISTIL_MIN_COMPONENT_AREA = 0
 
-    gray = cv2.cvtColor(work, cv2.COLOR_BGR2GRAY)
-    return gray
+FLOWER_SEGMENT_METHOD = "hsv"   # "hsv" | "otsu_gray" | "rgb"
+AUTO_SAVE_IMAGES = True
 
 
 def apply_mask_to_bgr(img_bgr, mask):
     return cv2.bitwise_and(img_bgr, img_bgr, mask=mask)
 
 
-def keep_largest_component(mask):
+def ensure_parent_dir(path):
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+
+def save_image(save_path, image):
+    """
+    Lưu ảnh BGR hoặc grayscale.
+    """
+    ensure_parent_dir(save_path)
+    ok = cv2.imwrite(save_path, image)
+    if not ok:
+        raise IOError(f"Khong luu duoc anh: {save_path}")
+
+
+def save_mask_image(
+    mask,
+    save_path,
+    invert=False,
+    as_bgr=False,
+    scale=1.0
+):
+    """
+    Hàm riêng để lưu mask theo ý muốn.
+    Tham số:
+    - mask     : mask đầu vào
+    - save_path: đường dẫn lưu
+    - invert   : đảo mask trước khi lưu hay không
+    - as_bgr   : lưu mask dưới dạng 3 kênh hay không
+    - scale    : scale ảnh khi lưu (ví dụ 2.0 để phóng to)
+    """
+    if mask is None:
+        raise ValueError("mask is None")
+
+    out = mask.copy()
+
+    if out.dtype != np.uint8:
+        out = out.astype(np.uint8)
+
+    if out.max() <= 1:
+        out = out * 255
+
+    out = np.where(out > 0, 255, 0).astype(np.uint8)
+
+    if invert:
+        out = cv2.bitwise_not(out)
+
+    if scale is not None and abs(scale - 1.0) > 1e-9:
+        h, w = out.shape[:2]
+        new_w = max(1, int(round(w * scale)))
+        new_h = max(1, int(round(h * scale)))
+        out = cv2.resize(out, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
+
+    if as_bgr:
+        out = cv2.cvtColor(out, cv2.COLOR_GRAY2BGR)
+
+    save_image(save_path, out)
+
+
+def save_output_images(output_dir, original_img, result_img, flower_mask, pistil_mask):
+    """
+    Lưu 4 ảnh chuẩn:
+    - ảnh gốc
+    - ảnh detect
+    - mask hoa
+    - mask nhụy
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    save_image(os.path.join(output_dir, "01_original.png"), original_img)
+    save_image(os.path.join(output_dir, "02_detected.png"), result_img)
+    save_mask_image(flower_mask, os.path.join(output_dir, "03_flower_mask.png"))
+    save_mask_image(pistil_mask, os.path.join(output_dir, "04_pistil_mask.png"))
+
+
+def remove_small_components(mask, min_area=300):
+    """
+    Loại bỏ các cụm liên thông nhỏ hơn min_area.
+    Giữ lại tất cả vùng đủ lớn.
+    """
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+
     if num_labels <= 1:
         return mask
 
-    largest_id = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
-    out = np.where(labels == largest_id, 255, 0).astype(np.uint8)
+    out = np.zeros_like(mask)
+
+    for label_id in range(1, num_labels):
+        area = stats[label_id, cv2.CC_STAT_AREA]
+        if area >= min_area:
+            out[labels == label_id] = 255
+
     return out
 
 
-def flower_mask_hsv(img_bgr, keep_largest=True):
+def split_connected_components(mask, min_area=1):
     """
-    Tách bông hoa vàng bằng HSV.
-    Lưu ý: hậu xử lý giữ nhẹ để không làm mất 'lỗ' bên trong mask,
-    vì lỗ đó sẽ được xem là contour trong của nhụy.
+    Tách từng cụm liên thông thành list mask riêng.
     """
-    blur = cv2.GaussianBlur(img_bgr, (5, 5), 0)
-    hsv = cv2.cvtColor(blur, cv2.COLOR_BGR2HSV)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
 
-    # Có thể chỉnh lại nếu ảnh khác nhiều
-    lower = np.array([15, 60, 30], dtype=np.uint8)
-    upper = np.array([35, 255, 255], dtype=np.uint8)
+    components = []
+    for label_id in range(1, num_labels):
+        area = stats[label_id, cv2.CC_STAT_AREA]
+        if area >= min_area:
+            comp = np.zeros_like(mask)
+            comp[labels == label_id] = 255
+            components.append(comp)
+
+    return components
+
+
+def flower_mask_hsv(img_bgr, remove_small=True, min_component_area=300):
+    """
+    Tách mask hoa bằng HSV.
+    """
+    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+
+    lower = np.array([10, 0, 0], dtype=np.uint8)
+    upper = np.array([30, 255, 255], dtype=np.uint8)
 
     mask = cv2.inRange(hsv, lower, upper)
 
-    kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_open, iterations=1)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+    mask = cv2.medianBlur(mask, 5)
 
-    if keep_largest:
-        mask = keep_largest_component(mask)
+    if remove_small:
+        mask = remove_small_components(mask, min_area=min_component_area)
 
     return mask
 
 
-def contour_centroid_from_contour(cnt):
-    if cnt is None:
-        return None
-
-    M = cv2.moments(cnt)
-    if abs(M["m00"]) < 1e-9:
-        return None
-
-    cx = int(M["m10"] / M["m00"])
-    cy = int(M["m01"] / M["m00"])
-    return (cx, cy)
-
-
-def find_outer_and_inner_contour_from_flower_mask(flower_mask):
+def flower_mask_otsu_gray(
+    img_bgr,
+    blur_ksize=5,
+    invert=False,
+    remove_small=True,
+    min_component_area=300
+):
     """
-    Tìm contour ngoài và contour trong trực tiếp từ flower_mask.
-    - contour ngoài: contour lớn nhất có parent = -1
-    - contour trong: contour con lớn nhất của contour ngoài
+    Phân ngưỡng Otsu theo ảnh grayscale.
     """
-    work = flower_mask.copy()
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
 
-    contours, hierarchy = cv2.findContours(
-        work,
-        cv2.RETR_CCOMP,
-        cv2.CHAIN_APPROX_SIMPLE
-    )
+    if blur_ksize is not None and blur_ksize >= 3:
+        if blur_ksize % 2 == 0:
+            blur_ksize += 1
+        gray = cv2.GaussianBlur(gray, (blur_ksize, blur_ksize), 0)
 
-    if len(contours) == 0 or hierarchy is None:
-        return None, None, None
+    thresh_type = cv2.THRESH_BINARY_INV if invert else cv2.THRESH_BINARY
+    _, mask = cv2.threshold(gray, 0, 255, thresh_type | cv2.THRESH_OTSU)
 
-    hierarchy = hierarchy[0]
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11,11))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+    mask = cv2.medianBlur(mask, 5)
 
-    # ===== tìm contour ngoài lớn nhất =====
-    outer_ids = [i for i in range(len(contours)) if hierarchy[i][3] == -1]
-    if len(outer_ids) == 0:
-        return None, None, None
+    if remove_small:
+        mask = remove_small_components(mask, min_area=min_component_area)
 
-    outer_id = max(outer_ids, key=lambda i: cv2.contourArea(contours[i]))
-    outer_cnt = contours[outer_id]
+    return mask
 
-    # ===== tìm các contour con trực tiếp của contour ngoài =====
-    child_ids = []
-    child = hierarchy[outer_id][2]  # first child
-    while child != -1:
-        child_ids.append(child)
-        child = hierarchy[child][0]  # next sibling
 
-    inner_cnt = None
-    if len(child_ids) > 0:
-        inner_id = max(child_ids, key=lambda i: cv2.contourArea(contours[i]))
-        if cv2.contourArea(contours[inner_id]) > 5:
-            inner_cnt = contours[inner_id]
+def flower_mask_rgb(
+    img_bgr,
+    r_range=(120, 255),
+    g_range=(80, 255),
+    b_range=(0, 200),
+    remove_small=True,
+    min_component_area=300
+):
+    """
+    Phân ngưỡng theo RGB.
+    Bạn có thể chỉnh các khoảng r_range, g_range, b_range theo ý muốn.
+    """
+    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    r = img_rgb[:, :, 0]
+    g = img_rgb[:, :, 1]
+    b = img_rgb[:, :, 2]
 
-    # ===== fallback nếu hierarchy không ra contour trong như mong muốn =====
-    hole_mask = np.zeros_like(flower_mask)
-    if inner_cnt is None:
-        filled_outer = np.zeros_like(flower_mask)
-        cv2.drawContours(filled_outer, [outer_cnt], -1, 255, thickness=-1)
+    mask = (
+        (r >= r_range[0]) & (r <= r_range[1]) &
+        (g >= g_range[0]) & (g <= g_range[1]) &
+        (b >= b_range[0]) & (b <= b_range[1])
+    ).astype(np.uint8) * 255
 
-        # phần nằm trong contour ngoài nhưng không nằm trong mask gốc => lỗ bên trong
-        hole_mask = cv2.subtract(filled_outer, flower_mask)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+    mask = cv2.medianBlur(mask, 5)
 
-        hole_contours, _ = cv2.findContours(
-            hole_mask,
-            cv2.RETR_EXTERNAL,
-            cv2.CHAIN_APPROX_SIMPLE
+    if remove_small:
+        mask = remove_small_components(mask, min_area=min_component_area)
+
+    return mask
+
+
+def get_flower_mask(img_bgr, method="hsv", min_component_area=300):
+    """
+    Bộ chọn phương pháp phân ngưỡng hoa.
+    """
+    method = method.lower().strip()
+
+    if method == "hsv":
+        return flower_mask_hsv(
+            img_bgr,
+            remove_small=True,
+            min_component_area=min_component_area
         )
 
-        if len(hole_contours) > 0:
-            inner_cnt = max(hole_contours, key=cv2.contourArea)
-            if cv2.contourArea(inner_cnt) <= 5:
-                inner_cnt = None
-    else:
-        cv2.drawContours(hole_mask, [inner_cnt], -1, 255, thickness=-1)
+    if method == "otsu_gray":
+        return flower_mask_otsu_gray(
+            img_bgr,
+            invert=False,
+            remove_small=True,
+            min_component_area=min_component_area
+        )
 
-    return outer_cnt, inner_cnt, hole_mask
+    if method == "rgb":
+        return flower_mask_rgb(
+            img_bgr,
+            r_range=(120, 255),
+            g_range=(80, 255),
+            b_range=(0, 200),
+            remove_small=True,
+            min_component_area=min_component_area
+        )
+
+    raise ValueError(f"Unsupported FLOWER_SEGMENT_METHOD: {method}")
 
 
-def draw_boxes_and_centers_on_original(img_bgr, outer_cnt, inner_cnt):
+def get_largest_external_contour(mask):
     """
-    Ảnh hiển thị 1:
-    - vẽ contour ngoài, contour trong
-    - vẽ bounding box
-    - vẽ tâm flower, tâm nhụy
+    Lấy contour ngoài lớn nhất của một mask.
     """
-    out = img_bgr.copy()
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if len(contours) == 0:
+        return None
+    return max(contours, key=cv2.contourArea)
 
-    center_flower = None
-    center_pistil = None
 
-    if outer_cnt is not None:
-        cv2.drawContours(out, [outer_cnt], -1, (0, 255, 0), 2)
+def contour_to_filled_mask(shape_hw, cnt):
+    mask = np.zeros(shape_hw, dtype=np.uint8)
+    if cnt is not None:
+        cv2.drawContours(mask, [cnt], -1, 255, thickness=-1)
+    return mask
 
-        x, y, w, h = cv2.boundingRect(outer_cnt)
-        cv2.rectangle(out, (x, y), (x + w, y + h), (0, 255, 0), 2)
 
-        center_flower = contour_centroid_from_contour(outer_cnt)
-        if center_flower is not None:
-            cx, cy = center_flower
-            cv2.circle(out, (cx, cy), 5, (0, 255, 0), -1)
-            cv2.putText(
-                out, "Flower C", (cx + 8, cy - 8),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2, cv2.LINE_AA
-            )
+def fit_ellipse_from_contour(cnt):
+    """
+    Fit ellipse từ contour.
+    """
+    if cnt is None:
+        return None, None
 
-    if inner_cnt is not None:
-        cv2.drawContours(out, [inner_cnt], -1, (255, 0, 255), 2)
+    if len(cnt) < 5:
+        return None, None
 
-        x, y, w, h = cv2.boundingRect(inner_cnt)
-        cv2.rectangle(out, (x, y), (x + w, y + h), (255, 0, 255), 2)
+    ellipse = cv2.fitEllipse(cnt)
+    (cx, cy), _, _ = ellipse
+    center = (int(round(cx)), int(round(cy)))
 
-        center_pistil = contour_centroid_from_contour(inner_cnt)
-        if center_pistil is not None:
-            cx, cy = center_pistil
-            cv2.circle(out, (cx, cy), 5, (255, 0, 255), -1)
-            cv2.putText(
-                out, "Pistil C", (cx + 8, cy - 8),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 0, 255), 2, cv2.LINE_AA
-            )
-
-    return out, center_flower, center_pistil
+    return ellipse, center
 
 
 def compute_direction_info(center_flower, center_pistil):
+    """
+    Hướng véc tơ: từ tâm nhị/nhụy -> tâm hoa
+    """
     if center_flower is None or center_pistil is None:
         return None
 
     cx_f, cy_f = center_flower
     cx_p, cy_p = center_pistil
 
-    dx = float(cx_p - cx_f)
-    dy = float(cy_p - cy_f)
+    dx = float(cx_f - cx_p)
+    dy = float(cy_f - cy_p)
 
     norm = np.hypot(dx, dy)
     if norm < 1e-9:
@@ -212,117 +322,231 @@ def compute_direction_info(center_flower, center_pistil):
     }
 
 
-def draw_vector_on_original(img_bgr, outer_cnt, inner_cnt, center_flower, center_pistil):
+def find_pistil_masks_by_inverting_flower(flower_component_mask, min_component_area=20):
+    outer_cnt = get_largest_external_contour(flower_component_mask)
+    if outer_cnt is None:
+        return [], None, None
+
+    filled_outer = contour_to_filled_mask(flower_component_mask.shape, outer_cnt)
+
+    inv_flower = cv2.bitwise_not(flower_component_mask)
+    pistil_candidate = cv2.bitwise_and(inv_flower, filled_outer)
+
+    largest_pistil_cnt = get_largest_external_contour(pistil_candidate)
+
+    if largest_pistil_cnt is None:
+        pistil_components = []
+    else:
+        if cv2.contourArea(largest_pistil_cnt) < float(min_component_area):
+            pistil_components = []
+        else:
+            largest_pistil_mask = contour_to_filled_mask(
+                flower_component_mask.shape,
+                largest_pistil_cnt
+            )
+            pistil_components = [largest_pistil_mask]
+
+    return pistil_components, outer_cnt, filled_outer
+
+
+def analyze_all_flowers_and_pistils(
+    img_bgr,
+    flower_min_component_area=300,
+    pistil_min_component_area=20,
+    flower_segment_method="hsv"
+):
     """
-    Ảnh hiển thị 2:
-    - vẽ lại contour ngoài, contour trong
-    - vẽ véc tơ hướng từ tâm flower -> tâm nhụy
+    Phân tích toàn bộ:
+    - tất cả flower masks
+    - tất cả mask nhụy tìm được từ từng flower bằng INV
+    """
+    flower_mask_all = get_flower_mask(
+        img_bgr,
+        method=flower_segment_method,
+        min_component_area=flower_min_component_area
+    )
+
+    flower_components = split_connected_components(
+        flower_mask_all,
+        min_area=flower_min_component_area
+    )
+
+    all_results = []
+    pistil_mask_all = np.zeros_like(flower_mask_all)
+
+    for flower_idx, flower_comp_mask in enumerate(flower_components, start=1):
+        pistil_components, outer_cnt, filled_outer = find_pistil_masks_by_inverting_flower(
+            flower_comp_mask,
+            min_component_area=pistil_min_component_area
+        )
+
+        flower_ellipse, center_flower = fit_ellipse_from_contour(outer_cnt)
+
+        flower_info = {
+            "flower_idx": flower_idx,
+            "flower_mask": flower_comp_mask,
+            "flower_contour": outer_cnt,
+            "flower_filled_mask": filled_outer,
+            "flower_ellipse": flower_ellipse,
+            "center_flower": center_flower,
+            "flower_area": float(cv2.contourArea(outer_cnt)) if outer_cnt is not None else 0.0,
+            "pistils": []
+        }
+
+        for pistil_idx, pistil_comp_mask in enumerate(pistil_components, start=1):
+            pistil_mask_all = cv2.bitwise_or(pistil_mask_all, pistil_comp_mask)
+
+            pistil_cnt = get_largest_external_contour(pistil_comp_mask)
+            pistil_ellipse, center_pistil = fit_ellipse_from_contour(pistil_cnt)
+            dir_info = compute_direction_info(center_flower, center_pistil)
+
+            pistil_info = {
+                "pistil_idx": pistil_idx,
+                "pistil_mask": pistil_comp_mask,
+                "pistil_contour": pistil_cnt,
+                "pistil_ellipse": pistil_ellipse,
+                "center_pistil": center_pistil,
+                "pistil_area": float(cv2.contourArea(pistil_cnt)) if pistil_cnt is not None else 0.0,
+                "dir_info": dir_info
+            }
+
+            flower_info["pistils"].append(pistil_info)
+
+        all_results.append(flower_info)
+
+    return flower_mask_all, pistil_mask_all, all_results
+
+
+def draw_all_results(img_bgr, all_results, draw_thickness=4):
+    """
+    Vẽ tất cả ellipse, tâm và véc tơ.
     """
     out = img_bgr.copy()
 
-    if outer_cnt is not None:
-        cv2.drawContours(out, [outer_cnt], -1, (0, 255, 0), 2)
+    flower_color = (255, 255, 0)   # cyan trong BGR
+    pistil_color = (0, 0, 255)     # đỏ
+    vector_color = (255, 0, 0)     # xanh dương
 
-    if inner_cnt is not None:
-        cv2.drawContours(out, [inner_cnt], -1, (255, 0, 255), 2)
+    center_radius = draw_thickness + 2
 
-    if center_flower is not None:
-        cv2.circle(out, center_flower, 5, (0, 255, 0), -1)
+    for flower_info in all_results:
+        flower_ellipse = flower_info["flower_ellipse"]
+        center_flower = flower_info["center_flower"]
 
-    if center_pistil is not None:
-        cv2.circle(out, center_pistil, 5, (255, 0, 255), -1)
+        if flower_ellipse is not None:
+            cv2.ellipse(out, flower_ellipse, flower_color, draw_thickness, cv2.LINE_AA)
 
-    dir_info = compute_direction_info(center_flower, center_pistil)
-    if dir_info is None:
-        return out, None
+        if center_flower is not None:
+            cv2.circle(out, center_flower, center_radius, flower_color, -1, cv2.LINE_AA)
 
-    cx_f, cy_f = center_flower
-    cx_p, cy_p = center_pistil
+        for pistil_info in flower_info["pistils"]:
+            pistil_ellipse = pistil_info["pistil_ellipse"]
+            center_pistil = pistil_info["center_pistil"]
+            dir_info = pistil_info["dir_info"]
 
-    # véc tơ hướng: từ tâm flower -> tâm nhụy
-    cv2.arrowedLine(
-        out,
-        (cx_f, cy_f),
-        (cx_p, cy_p),
-        (0, 0, 255),
-        3,
-        tipLength=0.25
-    )
+            if pistil_ellipse is not None:
+                cv2.ellipse(out, pistil_ellipse, pistil_color, draw_thickness, cv2.LINE_AA)
 
-    txt1 = f"theta_img  = {dir_info['theta_img_deg']:.2f} deg"
-    txt2 = f"theta_math = {dir_info['theta_math_deg']:.2f} deg"
-    txt3 = f"theta_axis = {dir_info['theta_axis_deg']:.2f} deg"
+            if center_pistil is not None:
+                cv2.circle(out, center_pistil, center_radius, pistil_color, -1, cv2.LINE_AA)
 
-    cv2.putText(out, txt1, (15, 30),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2, cv2.LINE_AA)
-    cv2.putText(out, txt2, (15, 60),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2, cv2.LINE_AA)
-    cv2.putText(out, txt3, (15, 90),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2, cv2.LINE_AA)
+            if dir_info is not None and center_flower is not None and center_pistil is not None:
+                cv2.arrowedLine(
+                    out,
+                    center_pistil,
+                    center_flower,
+                    vector_color,
+                    draw_thickness + 1,
+                    cv2.LINE_AA,
+                    tipLength=0.22
+                )
 
-    return out, dir_info
+    return out
 
 
 def read_input_image():
-    img_name = "4.png"
+    img_name = "5.png"
     root_path = "tl1Img"
     path = os.path.join(".", root_path, img_name)
 
     img = cv2.imread(path)
     if img is None:
-        raise FileNotFoundError(f"Không đọc được ảnh: {path}")
+        raise FileNotFoundError(f"Khong doc duoc anh: {path}")
 
-    return img, path
+    return img, path, img_name
 
 
 def main():
-    img, img_path = read_input_image()
+    img, img_path, img_name = read_input_image()
+    OUTPUT_DIR = f"./saveImg/output_flower_detect{img_name}"
     print(f"Da doc anh: {img_path}")
-
-    gray = to_gray(img)
+    print(f"FLOWER_SEGMENT_METHOD = {FLOWER_SEGMENT_METHOD}")
 
     t0 = time.perf_counter()
 
-    # ====== tách mask bông hoa ======
-    flower_mask = flower_mask_hsv(img, keep_largest=True)
-    flower_only = apply_mask_to_bgr(img, flower_mask)
+    flower_mask_all, pistil_mask_all, all_results = analyze_all_flowers_and_pistils(
+        img,
+        flower_min_component_area=FLOWER_MIN_COMPONENT_AREA,
+        pistil_min_component_area=PISTIL_MIN_COMPONENT_AREA,
+        flower_segment_method=FLOWER_SEGMENT_METHOD
+    )
 
-    # ====== tìm contour ngoài và contour trong từ chính flower_mask ======
-    outer_cnt, inner_cnt, hole_mask = find_outer_and_inner_contour_from_flower_mask(flower_mask)
+    result_img = draw_all_results(
+        img,
+        all_results,
+        draw_thickness=DRAW_THICKNESS
+    )
 
     t1 = time.perf_counter()
     print(f"latency: {t1 - t0:.6f} s")
 
-    if outer_cnt is not None:
-        print(f"outer contour area  = {cv2.contourArea(outer_cnt):.2f}")
-    else:
-        print("Khong tim thay contour ngoai.")
+    total_flowers = len(all_results)
+    total_pistils = sum(len(f["pistils"]) for f in all_results)
 
-    if inner_cnt is not None:
-        print(f"inner contour area  = {cv2.contourArea(inner_cnt):.2f}")
-    else:
-        print("Khong tim thay contour trong (nhuy).")
+    print(f"tong so flower masks = {total_flowers}")
+    print(f"tong so pistil masks = {total_pistils}")
 
-    # ====== ảnh hiển thị 1: box + tâm ======
-    img_boxes, center_flower, center_pistil = draw_boxes_and_centers_on_original(
-        img, outer_cnt, inner_cnt
-    )
+    for flower_info in all_results:
+        print("-" * 60)
+        print(f"flower #{flower_info['flower_idx']}")
+        print(f"  flower_area   = {flower_info['flower_area']:.2f}")
+        print(f"  center_flower = {flower_info['center_flower']}")
+        print(f"  flower_ellipse = {flower_info['flower_ellipse']}")
 
-    print("center_flower =", center_flower)
-    print("center_pistil =", center_pistil)
+        if len(flower_info["pistils"]) == 0:
+            print("  Khong tim thay pistil mask nao trong flower nay.")
+            continue
 
-    # ====== ảnh hiển thị 2: véc tơ hướng ======
-    img_vector, dir_info = draw_vector_on_original(
-        img, outer_cnt, inner_cnt, center_flower, center_pistil
-    )
+        for pistil_info in flower_info["pistils"]:
+            print(f"  pistil #{pistil_info['pistil_idx']}")
+            print(f"    pistil_area   = {pistil_info['pistil_area']:.2f}")
+            print(f"    center_pistil = {pistil_info['center_pistil']}")
+            print(f"    pistil_ellipse = {pistil_info['pistil_ellipse']}")
 
-    if dir_info is not None:
-        print(f"dx = {dir_info['dx']:.3f}, dy = {dir_info['dy']:.3f}")
-        print(f"theta_img_deg  = {dir_info['theta_img_deg']:.3f}")
-        print(f"theta_math_deg = {dir_info['theta_math_deg']:.3f}")
-        print(f"theta_axis_deg = {dir_info['theta_axis_deg']:.3f}")
+            dir_info = pistil_info["dir_info"]
+            if dir_info is not None:
+                print(f"    dx = {dir_info['dx']:.3f}, dy = {dir_info['dy']:.3f}")
+                print(f"    theta_img_deg  = {dir_info['theta_img_deg']:.3f}")
+                print(f"    theta_math_deg = {dir_info['theta_math_deg']:.3f}")
+                print(f"    theta_axis_deg = {dir_info['theta_axis_deg']:.3f}")
+            else:
+                print("    Khong tinh duoc huong.")
 
-    # ====== hiển thị ======
+    if AUTO_SAVE_IMAGES:
+        save_output_images(
+            OUTPUT_DIR,
+            original_img=img,
+            result_img=result_img,
+            flower_mask=flower_mask_all,
+            pistil_mask=pistil_mask_all
+        )
+        print(f"Da luu anh vao thu muc: {OUTPUT_DIR}")
+
+        # Ví dụ gọi riêng hàm lưu mask nếu bạn muốn:
+        # save_mask_image(flower_mask_all, os.path.join(OUTPUT_DIR, "flower_mask_inv.png"), invert=True)
+        # save_mask_image(pistil_mask_all, os.path.join(OUTPUT_DIR, "pistil_mask_big.png"), scale=2.0)
+        # save_mask_image(flower_mask_all, os.path.join(OUTPUT_DIR, "flower_mask_bgr.png"), as_bgr=True)
+
     plt.figure(figsize=(16, 10))
 
     plt.subplot(2, 2, 1)
@@ -331,34 +555,18 @@ def main():
     plt.axis("off")
 
     plt.subplot(2, 2, 2)
-    plt.imshow(flower_mask, cmap="gray")
-    plt.title("Flower mask")
+    plt.imshow(flower_mask_all, cmap="gray")
+    plt.title("All flower masks")
     plt.axis("off")
 
     plt.subplot(2, 2, 3)
-    plt.imshow(cv2.cvtColor(img_boxes, cv2.COLOR_BGR2RGB))
-    plt.title("Image 1 - Bounding boxes and centers")
+    plt.imshow(pistil_mask_all, cmap="gray")
+    plt.title("All pistil masks (from INV flower mask)")
     plt.axis("off")
 
     plt.subplot(2, 2, 4)
-    plt.imshow(cv2.cvtColor(img_vector, cv2.COLOR_BGR2RGB))
-    plt.title("Image 2 - Direction vector on original")
-    plt.axis("off")
-
-    plt.tight_layout()
-    plt.show()
-
-    # ====== hiển thị thêm hole mask nếu muốn debug ======
-    plt.figure(figsize=(10, 4))
-
-    plt.subplot(1, 2, 1)
-    plt.imshow(cv2.cvtColor(flower_only, cv2.COLOR_BGR2RGB))
-    plt.title("Flower only")
-    plt.axis("off")
-
-    plt.subplot(1, 2, 2)
-    plt.imshow(hole_mask, cmap="gray")
-    plt.title("Inner hole mask (pistil region)")
+    plt.imshow(cv2.cvtColor(result_img, cv2.COLOR_BGR2RGB))
+    plt.title("Result - all ellipses, centers and directions")
     plt.axis("off")
 
     plt.tight_layout()

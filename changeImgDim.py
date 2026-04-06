@@ -6,8 +6,8 @@ import matplotlib.pyplot as plt
 # =========================
 # CONFIG
 # =========================
-IMG_NAME = "5.png"
-ROOT_PATH = "img"
+IMG_NAME = "1.png"
+ROOT_PATH = "tl1Img"
 
 
 def main():
@@ -85,7 +85,9 @@ def main():
     # Tách 3 kênh
     L, A, B = cv2.split(img_lab)
     r,g,b = cv2.split(img_rgb)
-
+    h,s,v = cv2.split(img_hsv)
+    # h,l,s = cv2.split(img_hls)
+    y,cr,cb = cv2.split(img_ycrcb)
     # =========================
     # HIỂN THỊ
     # =========================
@@ -102,17 +104,17 @@ def main():
     plt.axis("off")
 
     plt.subplot(2, 3, 3)
-    plt.imshow(L, cmap="gray")
+    plt.imshow(h, cmap="gray")
     plt.title("Kênh L - Lightness")
     plt.axis("off")
 
     plt.subplot(2, 3, 4)
-    plt.imshow(A, cmap="gray")
+    plt.imshow(s, cmap="gray")
     plt.title("Kênh A - Green <-> Red")
     plt.axis("off")
 
     plt.subplot(2, 3, 5)
-    plt.imshow(B, cmap="gray")
+    plt.imshow(v, cmap="gray")
     plt.title("Kênh B - Blue <-> Yellow")
     plt.axis("off")
 

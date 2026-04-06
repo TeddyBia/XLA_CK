@@ -9,17 +9,18 @@ import numpy as np
 # =========================
 # CONFIG
 # =========================
-IMG_NAME = "5.png"
+IMG_NAME = "1.png"
 ROOT_PATH = "img"
+OUTPUT_DIR = "output"
 
 FLOWER_CENTER_MODE = "ellipse"
 PISTIL_PERCENTILE = 80
 CENTER_RADIUS_RATIO = 0.12
 
-PISTIL_ASPECT_RATIO_THR = 1.4
+FLOWER_MIN_COMPONENT_AREA = 800
 MINOR_AXIS_DIST_DELTA = 3.0
 
-LAB_PATCH_RADIUS = 30
+LAB_PATCH_RADIUS = 80
 VECTOR_SCALE = 2.0
 
 
@@ -49,6 +50,19 @@ def keep_largest_component(mask):
 
     largest_id = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
     return np.where(labels == largest_id, 255, 0).astype(np.uint8)
+
+
+def remove_small_components(mask, min_area=100):
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    if num_labels <= 1:
+        return mask
+
+    out = np.zeros_like(mask)
+    for i in range(1, num_labels):
+        area = stats[i, cv2.CC_STAT_AREA]
+        if area >= min_area:
+            out[labels == i] = 255
+    return out
 
 
 def largest_contour_from_mask(binary_mask):
@@ -96,10 +110,139 @@ def point_to_line_distance(pt, line_point, line_dir):
     return float(np.linalg.norm(np.asarray(pt, dtype=np.float32) - proj))
 
 
+def contour_to_points_list(cnt):
+    if cnt is None:
+        return []
+    pts = np.asarray(cnt).reshape(-1, 2)
+    return [(int(x), int(y)) for x, y in pts]
+
+
+def mask_to_points_list(mask):
+    ys, xs = np.where(mask > 0)
+    return [(int(x), int(y)) for x, y in zip(xs, ys)]
+
+
+def write_points_block(f, name, points, points_per_line=12):
+    f.write(f"{name}_count = {len(points)}\n")
+    f.write(f"{name} = [\n")
+    for i in range(0, len(points), points_per_line):
+        chunk = points[i:i + points_per_line]
+        line = ", ".join([f"({x}, {y})" for x, y in chunk])
+        f.write(f"  {line},\n")
+    f.write("]\n\n")
+
+
+def contour_filled_mask(cnt, shape_hw):
+    h, w = shape_hw[:2]
+    out = np.zeros((h, w), dtype=np.uint8)
+    if cnt is not None:
+        cv2.drawContours(out, [cnt], -1, 255, thickness=-1)
+    return out
+
+
+def iou_binary_masks(mask_a, mask_b):
+    a = mask_a > 0
+    b = mask_b > 0
+    inter = np.logical_and(a, b).sum()
+    union = np.logical_or(a, b).sum()
+    if union == 0:
+        return 0.0
+    return float(inter / union)
+
+
+def save_geometry_to_txt(
+    txt_path,
+    img_name,
+    flower_mask,
+    flower_cnt,
+    flower_geom_info,
+    flower_minor_info,
+    pistil_mask,
+    pistil_cnt,
+    pistil_axis_info,
+):
+    flower_contour_points = contour_to_points_list(flower_cnt)
+    pistil_contour_points = contour_to_points_list(pistil_cnt)
+    pistil_mask_points = mask_to_points_list(pistil_mask)
+
+    os.makedirs(os.path.dirname(txt_path), exist_ok=True)
+
+    with open(txt_path, "w", encoding="utf-8") as f:
+        f.write(f"image_name = {img_name}\n\n")
+
+        f.write("========== FLOWER ==========\n")
+        f.write(f"flower_mask_nonzero_count = {int(np.count_nonzero(flower_mask))}\n\n")
+        write_points_block(f, "flower_mask_contour_points", flower_contour_points)
+
+        flower_mode = flower_geom_info.get("mode", None)
+        f.write(f"flower_geometry_mode = {flower_mode}\n")
+        if flower_mode == "ellipse":
+            (cx, cy), (MA, ma), angle = flower_geom_info["ellipse"]
+            f.write(f"flower_ellipse_center = ({cx:.6f}, {cy:.6f})\n")
+            f.write(f"flower_ellipse_axes = (major_like={MA:.6f}, minor_like={ma:.6f})\n")
+            f.write(f"flower_ellipse_angle_deg = {angle:.6f}\n")
+        elif flower_mode == "circle":
+            (cx, cy), radius = flower_geom_info["circle"]
+            f.write(f"flower_circle_center = ({cx:.6f}, {cy:.6f})\n")
+            f.write(f"flower_circle_radius = {radius:.6f}\n")
+        f.write("\n")
+
+        if flower_minor_info:
+            f.write("flower_minor_axis_available = True\n")
+            f.write(f"flower_minor_axis_center = {flower_minor_info.get('center_int', None)}\n")
+            f.write(f"flower_minor_axis_length = {flower_minor_info.get('minor_len', None)}\n")
+            f.write(f"flower_minor_axis_dir = {flower_minor_info.get('minor_dir', None)}\n")
+            f.write(f"flower_minor_axis_point_1 = {flower_minor_info.get('minor_p1', None)}\n")
+            f.write(f"flower_minor_axis_point_2 = {flower_minor_info.get('minor_p2', None)}\n")
+            f.write(f"flower_major_axis_point_1 = {flower_minor_info.get('major_p1', None)}\n")
+            f.write(f"flower_major_axis_point_2 = {flower_minor_info.get('major_p2', None)}\n")
+        else:
+            f.write("flower_minor_axis_available = False\n")
+        f.write("\n")
+
+        f.write("========== PISTIL ==========\n")
+        f.write(f"pistil_mask_nonzero_count = {int(np.count_nonzero(pistil_mask))}\n\n")
+        write_points_block(f, "pistil_mask_nonzero_points", pistil_mask_points)
+        write_points_block(f, "pistil_mask_contour_points", pistil_contour_points)
+
+        f.write(f"pistil_mode = {pistil_axis_info.get('mode', None)}\n")
+        f.write(f"pistil_shape_selected = {pistil_axis_info.get('shape_selected', None)}\n")
+        f.write(f"pistil_circle_iou = {pistil_axis_info.get('circle_iou', None)}\n")
+        f.write(f"pistil_ellipse_iou = {pistil_axis_info.get('ellipse_iou', None)}\n")
+        f.write(f"pistil_selected_by = {pistil_axis_info.get('selected_by', None)}\n")
+
+        circle = pistil_axis_info.get("circle", None)
+        if circle is not None:
+            (ccx, ccy), cr = circle
+            f.write(f"pistil_circle_center = ({ccx:.6f}, {ccy:.6f})\n")
+            f.write(f"pistil_circle_radius = {cr:.6f}\n")
+
+        ellipse = pistil_axis_info.get("ellipse", None)
+        if ellipse is not None:
+            (ecx, ecy), (ea, eb), eangle = ellipse
+            f.write(f"pistil_ellipse_center = ({ecx:.6f}, {ecy:.6f})\n")
+            f.write(f"pistil_ellipse_axes = (axis_a={ea:.6f}, axis_b={eb:.6f})\n")
+            f.write(f"pistil_ellipse_angle_deg = {eangle:.6f}\n")
+            f.write(f"pistil_ellipse_major_len = {pistil_axis_info.get('ellipse_major_len', None)}\n")
+            f.write(f"pistil_ellipse_minor_len = {pistil_axis_info.get('ellipse_minor_len', None)}\n")
+
+        f.write(f"pistil_line_candidate_a = {pistil_axis_info.get('candidate_a', None)}\n")
+        f.write(f"pistil_line_candidate_b = {pistil_axis_info.get('candidate_b', None)}\n")
+        f.write(f"pistil_selected_base_point = {pistil_axis_info.get('base_pt', None)}\n")
+        f.write(f"pistil_selected_tip_point = {pistil_axis_info.get('tip_pt', None)}\n")
+        f.write(f"L_candidate_a = {pistil_axis_info.get('L_candidate_a', None)}\n")
+        f.write(f"L_candidate_b = {pistil_axis_info.get('L_candidate_b', None)}\n")
+        f.write(f"dist_a_to_minor_axis = {pistil_axis_info.get('dist_a_to_minor_axis', None)}\n")
+        f.write(f"dist_b_to_minor_axis = {pistil_axis_info.get('dist_b_to_minor_axis', None)}\n")
+        f.write(f"dist_gap = {pistil_axis_info.get('dist_gap', None)}\n")
+        f.write(f"axis_dist_delta = {pistil_axis_info.get('axis_dist_delta', None)}\n")
+        f.write(f"minor_axis_available_for_selection = {pistil_axis_info.get('minor_axis_available', None)}\n")
+
+
 # =========================
 # FLOWER MASK
 # =========================
-def flower_mask_hsv(img_bgr, keep_largest=True):
+def flower_mask_hsv(img_bgr, min_component_area=800):
     hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
 
     lower = np.array([18, 80, 30], dtype=np.uint8)
@@ -107,14 +250,12 @@ def flower_mask_hsv(img_bgr, keep_largest=True):
 
     mask = cv2.inRange(hsv, lower, upper)
 
-    kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13))
-    kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    kernel_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (23, 23))
+    kernel_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (23, 23))
 
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_open, iterations=1)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_close, iterations=1)
-
-    if keep_largest:
-        mask = keep_largest_component(mask)
+    mask = remove_small_components(mask, min_area=min_component_area)
 
     return mask
 
@@ -146,6 +287,64 @@ def keep_component_nearest_center(mask, cx, cy, min_area=3):
 
     return np.where(labels == best_id, 255, 0).astype(np.uint8)
 
+def pistil_mask_from_flower_only_rgb(
+    flower_only_bgr,
+    flower_mask,
+    center_radius_ratio=0.22,
+    r_min=155,
+    r_max=180,
+    g_min=155,
+    g_max=180,
+):
+    kernel_inner = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11))
+    inner_flower = cv2.erode(flower_mask, kernel_inner, iterations=1)
+
+    ys, xs = np.where(inner_flower > 0)
+    if xs.size == 0:
+        return np.zeros_like(flower_mask), np.zeros_like(flower_mask)
+
+    M = cv2.moments(inner_flower)
+    if abs(M["m00"]) > 1e-9:
+        cx = int(M["m10"] / M["m00"])
+        cy = int(M["m01"] / M["m00"])
+    else:
+        cx = int(np.mean(xs))
+        cy = int(np.mean(ys))
+
+    x0, x1 = int(np.min(xs)), int(np.max(xs))
+    y0, y1 = int(np.min(ys)), int(np.max(ys))
+    box_w = x1 - x0 + 1
+    box_h = y1 - y0 + 1
+
+    h, w = flower_mask.shape
+    Y, X = np.ogrid[:h, :w]
+    r_limit = max(12, int(center_radius_ratio * max(box_w, box_h)))
+    center_gate = ((X - cx) ** 2 + (Y - cy) ** 2) <= r_limit ** 2
+
+    valid = (inner_flower > 0) & center_gate
+
+    rgb = cv2.cvtColor(flower_only_bgr, cv2.COLOR_BGR2RGB)
+    R, G, B = cv2.split(rgb)
+
+    candidate = (
+        (R >= r_min) & (R <= r_max) &
+        (G >= g_min) & (G <= g_max)
+    )
+
+    pistil = np.zeros_like(flower_mask)
+    pistil[candidate & valid] = 255
+
+    kernel_small = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (27, 27))
+    pistil = cv2.morphologyEx(pistil, cv2.MORPH_OPEN, kernel_small, iterations=1)
+    pistil = cv2.morphologyEx(pistil, cv2.MORPH_CLOSE, kernel_small, iterations=1)
+
+    pistil = keep_largest_component(pistil)
+
+    debug_vis = np.zeros_like(flower_mask)
+    debug_vis[valid] = 90
+    debug_vis[candidate & valid] = 255
+
+    return pistil, debug_vis
 
 def pistil_mask_from_flower_only(
     flower_only_bgr,
@@ -153,7 +352,7 @@ def pistil_mask_from_flower_only(
     pistil_percentile=80,
     center_radius_ratio=0.22,
 ):
-    kernel_inner = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    kernel_inner = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11,11))
     inner_flower = cv2.erode(flower_mask, kernel_inner, iterations=1)
 
     ys, xs = np.where(inner_flower > 0)
@@ -180,6 +379,7 @@ def pistil_mask_from_flower_only(
 
     b, g, r = cv2.split(flower_only_bgr.astype(np.float32))
     score = (g - r) + 0.01 * (g - b)
+    # score = 2 * g - r - b
 
     valid = (inner_flower > 0) & center_gate
     vals = score[valid]
@@ -189,13 +389,14 @@ def pistil_mask_from_flower_only(
     thr = np.percentile(vals, pistil_percentile)
 
     pistil = np.zeros_like(flower_mask)
+
     pistil[(score >= thr) & valid] = 255
 
-    kernel_small = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13))
+    kernel_small = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25))
     pistil = cv2.morphologyEx(pistil, cv2.MORPH_OPEN, kernel_small, iterations=1)
     pistil = cv2.morphologyEx(pistil, cv2.MORPH_CLOSE, kernel_small, iterations=1)
 
-    pistil = keep_component_nearest_center(pistil, cx, cy, min_area=3)
+    pistil = keep_largest_component(pistil)
     score_vis = normalize_to_uint8(score)
     return pistil, score_vis
 
@@ -278,6 +479,31 @@ def pistil_rotated_rect_from_contour(cnt):
     return rect, box
 
 
+def pistil_ellipse_from_contour(cnt):
+    if cnt is None or len(cnt) < 5:
+        return None
+    return cv2.fitEllipse(cnt)
+
+
+def draw_circle_mask(circle, shape_hw):
+    h, w = shape_hw[:2]
+    out = np.zeros((h, w), dtype=np.uint8)
+    if circle is None:
+        return out
+    (cx, cy), r = circle
+    cv2.circle(out, (int(round(cx)), int(round(cy))), int(round(r)), 255, thickness=-1)
+    return out
+
+
+def draw_ellipse_mask(ellipse, shape_hw):
+    h, w = shape_hw[:2]
+    out = np.zeros((h, w), dtype=np.uint8)
+    if ellipse is None:
+        return out
+    cv2.ellipse(out, ellipse, 255, thickness=-1)
+    return out
+
+
 def mean_L_around_point(L_channel, pt, radius=2):
     if L_channel is None or pt is None:
         return None
@@ -300,19 +526,8 @@ def mean_L_around_point(L_channel, pt, radius=2):
     return float(np.mean(patch))
 
 
-def pistil_base_and_tip_from_rotated_rect(
-    cnt,
-    flower_center,
-    flower_minor_info=None,
-    L_channel=None,
-    axis_dist_delta=3.0,
-    lab_patch_radius=30,
-):
-    if cnt is None or flower_center is None or len(cnt) < 3:
-        return None, None, {}
-
-    rect, box = pistil_rotated_rect_from_contour(cnt)
-    if rect is None:
+def endpoints_from_rotated_rect(rect, box):
+    if rect is None or box is None:
         return None, None, {}
 
     (cx, cy), (w, h), angle = rect
@@ -334,7 +549,12 @@ def pistil_base_and_tip_from_rotated_rect(
 
     if d_norm < 1e-12:
         c = (int(round(cx)), int(round(cy)))
-        return c, c, {"rect": rect, "box": box}
+        return c, c, {
+            "center": (float(cx), float(cy)),
+            "center_int": c,
+            "size": (float(w), float(h)),
+            "angle": float(angle),
+        }
 
     d = d / d_norm
     half_long = max(w, h) / 2.0
@@ -344,6 +564,63 @@ def pistil_base_and_tip_from_rotated_rect(
 
     p_a_int = tuple(np.round(p_a).astype(int))
     p_b_int = tuple(np.round(p_b).astype(int))
+
+    info = {
+        "center": (float(cx), float(cy)),
+        "center_int": center_int,
+        "size": (float(w), float(h)),
+        "angle": float(angle),
+    }
+    return p_a_int, p_b_int, info
+
+
+def endpoints_from_ellipse(ellipse):
+    if ellipse is None:
+        return None, None, {}
+
+    (cx, cy), (axis_a, axis_b), angle_deg = ellipse
+    center = np.array([cx, cy], dtype=np.float32)
+    theta = np.deg2rad(angle_deg)
+
+    u = np.array([np.cos(theta), np.sin(theta)], dtype=np.float32)
+    v = np.array([-np.sin(theta), np.cos(theta)], dtype=np.float32)
+
+    if axis_a >= axis_b:
+        major_len = float(axis_a)
+        minor_len = float(axis_b)
+        major_dir = u / max(np.linalg.norm(u), 1e-12)
+    else:
+        major_len = float(axis_b)
+        minor_len = float(axis_a)
+        major_dir = v / max(np.linalg.norm(v), 1e-12)
+
+    p_a = center - 0.5 * major_len * major_dir
+    p_b = center + 0.5 * major_len * major_dir
+
+    p_a_int = tuple(np.round(p_a).astype(int))
+    p_b_int = tuple(np.round(p_b).astype(int))
+
+    info = {
+        "center": (float(cx), float(cy)),
+        "center_int": (int(round(cx)), int(round(cy))),
+        "ellipse_major_len": major_len,
+        "ellipse_minor_len": minor_len,
+        "ellipse_major_dir": major_dir,
+    }
+    return p_a_int, p_b_int, info
+
+
+def select_base_tip_from_candidates(
+    p_a_int,
+    p_b_int,
+    flower_center,
+    flower_minor_info=None,
+    L_channel=None,
+    axis_dist_delta=3.0,
+    lab_patch_radius=30,
+):
+    if p_a_int is None or p_b_int is None:
+        return None, None, {}
 
     La = mean_L_around_point(L_channel, p_a_int, radius=lab_patch_radius)
     Lb = mean_L_around_point(L_channel, p_b_int, radius=lab_patch_radius)
@@ -385,8 +662,10 @@ def pistil_base_and_tip_from_rotated_rect(
 
     else:
         fc = np.array(flower_center, dtype=np.float32)
-        da = float(np.linalg.norm(p_a - fc))
-        db = float(np.linalg.norm(p_b - fc))
+        pa = np.array(p_a_int, dtype=np.float32)
+        pb = np.array(p_b_int, dtype=np.float32)
+        da = float(np.linalg.norm(pa - fc))
+        db = float(np.linalg.norm(pb - fc))
 
         if da <= db:
             base_pt = p_a_int
@@ -397,12 +676,6 @@ def pistil_base_and_tip_from_rotated_rect(
         selected_by = "distance_to_flower_center_fallback"
 
     return base_pt, tip_pt, {
-        "rect": rect,
-        "box": box,
-        "center": (float(cx), float(cy)),
-        "center_int": center_int,
-        "size": (float(w), float(h)),
-        "angle": float(angle),
         "candidate_a": p_a_int,
         "candidate_b": p_b_int,
         "L_candidate_a": La,
@@ -420,50 +693,90 @@ def pistil_base_and_tip_from_rotated_rect(
     }
 
 
-def pistil_base_tip_hybrid(
+def pistil_base_tip_by_iou(
     cnt,
     flower_center,
     flower_minor_info=None,
     L_channel=None,
-    aspect_thr=1.4,
     axis_dist_delta=3.0,
     lab_patch_radius=30,
+    image_shape=None,
 ):
-    if cnt is None:
+    if cnt is None or flower_center is None or image_shape is None:
         return None, None, {}
 
-    rect, box = pistil_rotated_rect_from_contour(cnt)
-    if rect is None:
-        c = contour_centroid_from_contour(cnt)
-        return c, c, {"mode": "centroid"}
+    object_mask = contour_filled_mask(cnt, image_shape)
 
-    (cx, cy), (w, h), _ = rect
-    long_side = max(w, h)
-    short_side = max(min(w, h), 1e-6)
-    aspect_ratio = float(long_side / short_side)
+    ellipse = pistil_ellipse_from_contour(cnt)
+    ellipse_mask = draw_ellipse_mask(ellipse, image_shape) if ellipse is not None else np.zeros_like(object_mask)
+    ellipse_iou = iou_binary_masks(object_mask, ellipse_mask) if ellipse is not None else -1.0
 
-    if aspect_ratio < aspect_thr:
-        c = (int(round(cx)), int(round(cy)))
-        return c, c, {
-            "mode": "frontal_circle_like",
-            "rect": rect,
-            "box": box,
-            "center": c,
-            "aspect_ratio": aspect_ratio,
-            "selected_by": "centroid_circle_like",
+    circle = None
+    circle_iou = -1.0
+    circle_data = pistil_circle_from_contour(cnt)
+    if circle_data is not None:
+        (ccx, ccy), cr = circle_data
+        circle = ((float(ccx), float(ccy)), float(cr))
+        circle_mask = draw_circle_mask(circle, image_shape)
+        circle_iou = iou_binary_masks(object_mask, circle_mask)
+
+    if circle_iou >= ellipse_iou and circle is not None:
+        shape_selected = "circle"
+        center_pt = (int(round(circle[0][0])), int(round(circle[0][1])))
+        info = {
+            "mode": "circle_like",
+            "shape_selected": shape_selected,
+            "circle": circle,
+            "ellipse": ellipse,
+            "circle_iou": circle_iou,
+            "ellipse_iou": ellipse_iou,
+            "shape_selected_by": "IoU",
+            "center": center_pt,
+            "center_int": center_pt,
+            "selected_by": "circle_center",
+            "base_pt": center_pt,
+            "tip_pt": center_pt,
+            "candidate_a": None,
+            "candidate_b": None,
+            "L_candidate_a": None,
+            "L_candidate_b": None,
+            "minor_axis_point": None,
+            "minor_axis_dir": None,
+            "dist_a_to_minor_axis": None,
+            "dist_b_to_minor_axis": None,
+            "dist_gap": None,
+            "axis_dist_delta": None,
+            "minor_axis_available": False,
         }
+        return center_pt, center_pt, info
 
-    base_pt, tip_pt, info = pistil_base_and_tip_from_rotated_rect(
-        cnt,
-        flower_center,
-        flower_minor_info=flower_minor_info,
-        L_channel=L_channel,
-        axis_dist_delta=axis_dist_delta,
-        lab_patch_radius=lab_patch_radius,
-    )
-    info["mode"] = "elongated_rect"
-    info["aspect_ratio"] = aspect_ratio
-    return base_pt, tip_pt, info
+    if ellipse is not None:
+        shape_selected = "ellipse"
+        p_a, p_b, geom_info = endpoints_from_ellipse(ellipse)
+        base_pt, tip_pt, select_info = select_base_tip_from_candidates(
+            p_a,
+            p_b,
+            flower_center,
+            flower_minor_info=flower_minor_info,
+            L_channel=L_channel,
+            axis_dist_delta=axis_dist_delta,
+            lab_patch_radius=lab_patch_radius,
+        )
+        info = {
+            "mode": shape_selected,
+            "shape_selected": shape_selected,
+            "circle": circle,
+            "ellipse": ellipse,
+            "circle_iou": circle_iou,
+            "ellipse_iou": ellipse_iou,
+            "shape_selected_by": "IoU",
+        }
+        info.update(geom_info)
+        info.update(select_info)
+        return base_pt, tip_pt, info
+
+    c = contour_centroid_from_contour(cnt)
+    return c, c, {"mode": "centroid_fallback", "shape_selected": "centroid", "circle_iou": circle_iou, "ellipse_iou": ellipse_iou}
 
 
 def pistil_circle_from_contour(cnt):
@@ -516,6 +829,7 @@ def draw_detection_image(
     pistil_base,
     pistil_tip,
     flower_geom_info,
+    flower_minor_info,
     pistil_axis_info,
 ):
     out = img_bgr.copy()
@@ -526,80 +840,52 @@ def draw_detection_image(
         x, y, w, h = cv2.boundingRect(flower_cnt)
         cv2.rectangle(out, (x, y), (x + w, y + h), (255, 0, 0), 2)
 
-    if pistil_cnt is not None:
-        cv2.drawContours(out, [pistil_cnt], -1, (0, 0, 255), 2)
-
-        if pistil_mode == "elongated_rect":
-            box = pistil_axis_info.get("box", None)
-            if box is not None:
-                cv2.drawContours(out, [np.asarray(box, dtype=np.int32)], 0, (0, 165, 255), 2)
-
-        elif pistil_mode == "frontal_circle_like":
-            circle_data = pistil_circle_from_contour(pistil_cnt)
-            if circle_data is not None:
-                c, r = circle_data
-                cv2.circle(out, c, r, (0, 165, 255), 2)
-
-    if flower_center is not None:
-        cv2.circle(out, flower_center, 6, (0, 255, 0), -1)
-        cv2.putText(
-            out,
-            f"Flower C {flower_center}",
-            (flower_center[0] + 8, flower_center[1] - 10),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.65,
-            (0, 255, 0),
-            2,
-            cv2.LINE_AA,
-        )
-
     if flower_geom_info.get("mode") == "circle":
         (cx, cy), r = flower_geom_info["circle"]
         cv2.circle(out, (int(round(cx)), int(round(cy))), int(round(r)), (0, 255, 0), 1)
     elif flower_geom_info.get("mode") == "ellipse":
         cv2.ellipse(out, flower_geom_info["ellipse"], (0, 255, 0), 1)
 
-    if pistil_mode == "frontal_circle_like":
+    if flower_center is not None:
+        cv2.circle(out, flower_center, 6, (0, 255, 0), -1)
+
+    if flower_minor_info:
+        minor_p1 = flower_minor_info.get("minor_p1", None)
+        minor_p2 = flower_minor_info.get("minor_p2", None)
+        if minor_p1 is not None and minor_p2 is not None:
+            cv2.line(out, minor_p1, minor_p2, (255, 0, 255), 2)
+
+    if pistil_cnt is not None:
+        cv2.drawContours(out, [pistil_cnt], -1, (0, 0, 255), 2)
+
+        ellipse = pistil_axis_info.get("ellipse", None)
+        if ellipse is not None:
+            cv2.ellipse(out, ellipse, (255, 255, 0), 2)
+
+        circle = pistil_axis_info.get("circle", None)
+        if circle is not None:
+            (ccx, ccy), cr = circle
+            cv2.circle(out, (int(round(ccx)), int(round(ccy))), int(round(cr)), (0, 165, 255), 2)
+
+        shape_selected = pistil_axis_info.get("shape_selected", None)
+        if shape_selected == "ellipse" and ellipse is not None:
+            cv2.putText(out, "IoU -> ellipse", (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 0), 2, cv2.LINE_AA)
+        elif shape_selected == "circle" and circle is not None:
+            cv2.putText(out, "IoU -> circle", (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 165, 255), 2, cv2.LINE_AA)
+
+    if pistil_mode == "circle_like":
         center_pt = pistil_axis_info.get("center", pistil_base)
         if center_pt is not None:
             cv2.circle(out, center_pt, 6, (255, 255, 0), -1)
-            cv2.putText(
-                out,
-                f"Pistil center {center_pt}",
-                (center_pt[0] + 8, center_pt[1] - 10),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.60,
-                (255, 255, 0),
-                2,
-                cv2.LINE_AA,
-            )
+            if flower_center is not None:
+                cv2.line(out, center_pt, flower_center, (0, 255, 0), 1)
         return out
 
     if pistil_base is not None:
         cv2.circle(out, pistil_base, 6, (255, 255, 0), -1)
-        cv2.putText(
-            out,
-            f"P1 {pistil_base}",
-            (pistil_base[0] + 8, pistil_base[1] - 10),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.60,
-            (255, 255, 0),
-            2,
-            cv2.LINE_AA,
-        )
 
     if pistil_tip is not None:
         cv2.circle(out, pistil_tip, 6, (0, 255, 255), -1)
-        cv2.putText(
-            out,
-            f"P2 {pistil_tip}",
-            (pistil_tip[0] + 8, pistil_tip[1] - 10),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.60,
-            (0, 255, 255),
-            2,
-            cv2.LINE_AA,
-        )
 
     if pistil_base is not None and pistil_tip is not None:
         cv2.line(out, pistil_base, pistil_tip, (255, 255, 255), 2)
@@ -633,12 +919,21 @@ def draw_direction_vector_image(
         cv2.circle(out, flower_center, 6, (0, 255, 0), -1)
         cv2.putText(out, f"Flower C = {flower_center}", (15, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 255, 0), 2, cv2.LINE_AA)
 
-    if pistil_mode == "frontal_circle_like":
+    shape_selected = pistil_axis_info.get("shape_selected", "unknown")
+    circle_iou = pistil_axis_info.get("circle_iou", None)
+    ellipse_iou = pistil_axis_info.get("ellipse_iou", None)
+    cv2.putText(out, f"shape = {shape_selected}", (15, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (255, 255, 255), 2, cv2.LINE_AA)
+    if circle_iou is not None and ellipse_iou is not None:
+        cv2.putText(out, f"IoU circle = {circle_iou:.3f} | IoU ellipse = {ellipse_iou:.3f}", (15, 105), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2, cv2.LINE_AA)
+
+    if pistil_mode == "circle_like":
         center_pt = pistil_axis_info.get("center", pistil_base)
         if center_pt is not None:
             cv2.circle(out, center_pt, 6, (255, 255, 0), -1)
-            cv2.putText(out, f"Pistil center = {center_pt}", (15, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (255, 255, 0), 2, cv2.LINE_AA)
-        cv2.putText(out, "Circle-like pistil -> khong ve vector huong", (15, 105), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (255, 255, 255), 2, cv2.LINE_AA)
+            cv2.putText(out, f"Pistil center = {center_pt}", (15, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (255, 255, 0), 2, cv2.LINE_AA)
+            if flower_center is not None:
+                cv2.line(out, center_pt, flower_center, (0, 255, 0), 2)
+        cv2.putText(out, "Circle-like pistil -> chi xet tam, khong ve vector huong", (15, 175), cv2.FONT_HERSHEY_SIMPLEX, 0.78, (255, 255, 255), 2, cv2.LINE_AA)
         return out, None
 
     if pistil_base is not None:
@@ -654,6 +949,7 @@ def draw_direction_vector_image(
 
     info = direction_from_points(pistil_base, pistil_tip)
     if info is None:
+        cv2.putText(out, "Khong tinh duoc vector huong", (15, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (255, 255, 255), 2, cv2.LINE_AA)
         return out, None
 
     L = int(max(70, vector_scale * info["norm"]))
@@ -664,11 +960,11 @@ def draw_direction_vector_image(
 
     cv2.arrowedLine(out, pistil_base, end_pt, (255, 255, 255), 5, tipLength=0.18)
 
-    cv2.putText(out, f"P1 = {pistil_base}", (15, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (255, 255, 0), 2, cv2.LINE_AA)
-    cv2.putText(out, f"P2 = {pistil_tip}", (15, 105), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 255, 255), 2, cv2.LINE_AA)
-    cv2.putText(out, f"dx = {info['dx']:.2f}, dy = {info['dy']:.2f}", (15, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (255, 255, 255), 2, cv2.LINE_AA)
-    cv2.putText(out, f"theta_axis = {info['theta_axis_deg']:.2f} deg", (15, 175), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 255, 255), 2, cv2.LINE_AA)
-    cv2.putText(out, "Doan xanh: P1 -> tam hoa | Mui ten trang: huong nhị P1 -> P2", (15, 210), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(out, f"P1 = {pistil_base}", (15, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (255, 255, 0), 2, cv2.LINE_AA)
+    cv2.putText(out, f"P2 = {pistil_tip}", (15, 175), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(out, f"dx = {info['dx']:.2f}, dy = {info['dy']:.2f}", (15, 210), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(out, f"theta_axis = {info['theta_axis_deg']:.2f} deg", (15, 245), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(out, "Doan xanh: P1 -> tam hoa | Mui ten trang: huong nhị P1 -> P2", (15, 280), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2, cv2.LINE_AA)
 
     return out, info
 
@@ -756,9 +1052,14 @@ def draw_pistil_selection_debug_image(
             )
             cv2.line(out, p1, p2, (255, 0, 255), 2)
 
-    box = pistil_axis_info.get("box", None)
-    if box is not None:
-        cv2.drawContours(out, [np.asarray(box, dtype=np.int32)], 0, (0, 165, 255), 2)
+    ellipse = pistil_axis_info.get("ellipse", None)
+    if ellipse is not None:
+        cv2.ellipse(out, ellipse, (255, 255, 0), 2)
+
+    circle = pistil_axis_info.get("circle", None)
+    if circle is not None:
+        (ccx, ccy), cr = circle
+        cv2.circle(out, (int(round(ccx)), int(round(ccy))), int(round(cr)), (0, 165, 255), 2)
 
     cand_a = pistil_axis_info.get("candidate_a", None)
     cand_b = pistil_axis_info.get("candidate_b", None)
@@ -802,54 +1103,68 @@ def draw_pistil_selection_debug_image(
         )
 
     pistil_mode = pistil_axis_info.get("mode", "")
-    if pistil_mode == "elongated_rect" and pistil_base is not None and pistil_tip is not None:
-        cv2.circle(out, pistil_base, 6, (255, 255, 0), -1)
-        cv2.circle(out, pistil_tip, 6, (0, 255, 255), -1)
-
-        if flower_center is not None:
-            cv2.line(out, pistil_base, flower_center, (0, 255, 0), 2)
-
-        cv2.line(out, pistil_base, pistil_tip, (255, 255, 255), 2)
-
-        dir_info = direction_from_points(pistil_base, pistil_tip)
-        if dir_info is not None:
-            L_vec = int(max(70, vector_scale * dir_info["norm"]))
-            end_pt = (
-                int(round(pistil_base[0] + L_vec * dir_info["ux"])),
-                int(round(pistil_base[1] + L_vec * dir_info["uy"])),
-            )
-            cv2.arrowedLine(out, pistil_base, end_pt, (255, 255, 255), 4, tipLength=0.18)
+    if pistil_mode == "circle_like":
+        center_pt = pistil_axis_info.get("center", pistil_base)
+        if center_pt is not None:
+            cv2.circle(out, center_pt, 6, (255, 255, 0), -1)
+            if flower_center is not None:
+                cv2.line(out, center_pt, flower_center, (0, 255, 0), 2)
             cv2.putText(
                 out,
-                f"theta_axis = {dir_info['theta_axis_deg']:.2f} deg",
-                (15, 120),
+                "Circle-like -> chi xet tam, khong dung truc chinh",
+                (15, 150),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.72,
-                (0, 255, 255),
+                (255, 255, 255),
                 2,
                 cv2.LINE_AA,
             )
-    elif pistil_mode == "frontal_circle_like":
-        cv2.putText(
-            out,
-            "Circle-like pistil -> khong ve vector huong",
-            (15, 120),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.72,
-            (255, 255, 255),
-            2,
-            cv2.LINE_AA,
-        )
+    else:
+        if pistil_base is not None:
+            cv2.circle(out, pistil_base, 6, (255, 255, 0), -1)
+        if pistil_tip is not None:
+            cv2.circle(out, pistil_tip, 6, (0, 255, 255), -1)
+
+        if pistil_base is not None and pistil_tip is not None:
+            if flower_center is not None:
+                cv2.line(out, pistil_base, flower_center, (0, 255, 0), 2)
+
+            cv2.line(out, pistil_base, pistil_tip, (255, 255, 255), 2)
+
+            dir_info = direction_from_points(pistil_base, pistil_tip)
+            if dir_info is not None:
+                L_vec = int(max(70, vector_scale * dir_info["norm"]))
+                end_pt = (
+                    int(round(pistil_base[0] + L_vec * dir_info["ux"])),
+                    int(round(pistil_base[1] + L_vec * dir_info["uy"])),
+                )
+                cv2.arrowedLine(out, pistil_base, end_pt, (255, 255, 255), 4, tipLength=0.18)
+                cv2.putText(
+                    out,
+                    f"theta_axis = {dir_info['theta_axis_deg']:.2f} deg",
+                    (15, 150),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.72,
+                    (0, 255, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
 
     dist_gap = pistil_axis_info.get("dist_gap", None)
     axis_dist_delta = pistil_axis_info.get("axis_dist_delta", None)
     selected_by = pistil_axis_info.get("selected_by", "unknown")
     minor_axis_available = pistil_axis_info.get("minor_axis_available", False)
+    circle_iou = pistil_axis_info.get("circle_iou", None)
+    ellipse_iou = pistil_axis_info.get("ellipse_iou", None)
+    shape_selected = pistil_axis_info.get("shape_selected", "unknown")
 
-    cv2.putText(out, f"minor axis available = {minor_axis_available}", (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2, cv2.LINE_AA)
-    cv2.putText(out, f"selected_by = {selected_by}", (15, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (0, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(out, f"shape_selected = {shape_selected}", (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2, cv2.LINE_AA)
+    if circle_iou is not None and ellipse_iou is not None:
+        cv2.putText(out, f"IoU circle = {circle_iou:.3f} | ellipse = {ellipse_iou:.3f}", (15, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(out, f"minor axis available = {minor_axis_available}", (15, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(out, f"selected_by = {selected_by}", (15, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (0, 255, 255), 2, cv2.LINE_AA)
     if dist_gap is not None and axis_dist_delta is not None:
-        cv2.putText(out, f"dist_gap = {dist_gap:.2f} | delta = {axis_dist_delta:.2f}", (15, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(out, f"dist_gap = {dist_gap:.2f} | delta = {axis_dist_delta:.2f}", (15, 180), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2, cv2.LINE_AA)
 
     return out
 
@@ -875,7 +1190,7 @@ def main():
 
     t0 = time.perf_counter()
 
-    flower_mask = flower_mask_hsv(img, keep_largest=True)
+    flower_mask = flower_mask_hsv(img, min_component_area=FLOWER_MIN_COMPONENT_AREA)
     flower_only = apply_mask_to_bgr(img, flower_mask)
     flower_cnt = largest_contour_from_mask(flower_mask)
     flower_center, flower_geom_info = flower_reference_center_from_outer_contour(
@@ -884,22 +1199,25 @@ def main():
     )
     flower_minor_info = flower_minor_axis_from_contour(flower_cnt)
 
-    pistil_mask, pistil_score_vis = pistil_mask_from_flower_only(
+    pistil_mask, pistil_score_vis = pistil_mask_from_flower_only_rgb(
         flower_only,
         flower_mask,
-        pistil_percentile=PISTIL_PERCENTILE,
         center_radius_ratio=CENTER_RADIUS_RATIO,
+        r_min=100,
+        r_max=200,
+        g_min=100,
+        g_max=210,
     )
     pistil_cnt = largest_contour_from_mask(pistil_mask)
 
-    pistil_base, pistil_tip, pistil_axis_info = pistil_base_tip_hybrid(
+    pistil_base, pistil_tip, pistil_axis_info = pistil_base_tip_by_iou(
         pistil_cnt,
         flower_center,
         flower_minor_info=flower_minor_info,
         L_channel=L_channel,
-        aspect_thr=PISTIL_ASPECT_RATIO_THR,
         axis_dist_delta=MINOR_AXIS_DIST_DELTA,
         lab_patch_radius=LAB_PATCH_RADIUS,
+        image_shape=img.shape[:2],
     )
 
     candidate_a = pistil_axis_info.get("candidate_a", None)
@@ -911,11 +1229,27 @@ def main():
     dist_gap = pistil_axis_info.get("dist_gap", None)
     selected_by = pistil_axis_info.get("selected_by", None)
     minor_axis_available = pistil_axis_info.get("minor_axis_available", None)
+    circle_iou = pistil_axis_info.get("circle_iou", None)
+    ellipse_iou = pistil_axis_info.get("ellipse_iou", None)
+    shape_selected = pistil_axis_info.get("shape_selected", None)
+
+    txt_path = os.path.join(".", OUTPUT_DIR, f"{os.path.splitext(IMG_NAME)[0]}_geometry.txt")
+    save_geometry_to_txt(
+        txt_path=txt_path,
+        img_name=IMG_NAME,
+        flower_mask=flower_mask,
+        flower_cnt=flower_cnt,
+        flower_geom_info=flower_geom_info,
+        flower_minor_info=flower_minor_info,
+        pistil_mask=pistil_mask,
+        pistil_cnt=pistil_cnt,
+        pistil_axis_info=pistil_axis_info,
+    )
 
     t1 = time.perf_counter()
 
     print(f"latency: {t1 - t0:.6f} s")
-    print("flower_center =", flower_center)
+    print("flower_center  =", flower_center)
     print("pistil_point_1 =", pistil_base)
     print("pistil_point_2 =", pistil_tip)
     print("candidate_a    =", candidate_a, "L_mean =", La, "dist_to_minor_axis =", dist_a)
@@ -923,7 +1257,10 @@ def main():
     print("dist_gap       =", dist_gap)
     print("minor axis ok  =", minor_axis_available)
     print("selected_by    =", selected_by)
-    print("pistil_mode    =", pistil_axis_info.get("mode", None))
+    print("shape_selected =", shape_selected)
+    print("circle_iou     =", circle_iou)
+    print("ellipse_iou    =", ellipse_iou)
+    print("txt_path       =", txt_path)
 
     if flower_cnt is not None:
         print(f"flower contour area = {cv2.contourArea(flower_cnt):.2f}")
@@ -943,6 +1280,7 @@ def main():
         pistil_base,
         pistil_tip,
         flower_geom_info,
+        flower_minor_info,
         pistil_axis_info,
     )
 
@@ -975,7 +1313,7 @@ def main():
         print(f"pistil dx = {dir_info['dx']:.3f}, dy = {dir_info['dy']:.3f}")
         print(f"pistil theta_axis_deg = {dir_info['theta_axis_deg']:.3f}")
     else:
-        print("Pistil gan hinh tron -> khong tinh / khong ve vector huong.")
+        print("Khong tinh / khong ve vector huong.")
 
     plt.figure(figsize=(24, 12))
 
@@ -986,7 +1324,7 @@ def main():
 
     plt.subplot(2, 4, 2)
     plt.imshow(cv2.cvtColor(img_detect, cv2.COLOR_BGR2RGB))
-    plt.title("Hinh 1 - Vien hoa/nhuy va P1, P2")
+    plt.title("Hinh 1 - Vien/mask, ellipse/rect, P1-P2")
     plt.axis("off")
 
     plt.subplot(2, 4, 3)
@@ -1011,7 +1349,7 @@ def main():
 
     plt.subplot(2, 4, 7)
     plt.imshow(cv2.cvtColor(img_select_debug, cv2.COLOR_BGR2RGB))
-    plt.title("Hinh 6 - Ellipse + chon P1/P2 + vector")
+    plt.title("Hinh 6 - IoU ellipse/rect + chon P1/P2")
     plt.axis("off")
 
     plt.subplot(2, 4, 8)
